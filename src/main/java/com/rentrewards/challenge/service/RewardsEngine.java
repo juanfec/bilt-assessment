@@ -29,21 +29,27 @@ public class RewardsEngine {
     }
 
     public PointsResult processPayment(PaymentEvent event, MemberAccount member) {
-        if (processedEventStore.isDuplicate(event.getEventId())) {
+        if (!processedEventStore.tryMarkProcessed(event.getEventId())) {
             return new PointsResult(member.getMemberId(), 0, ProcessingOutcome.DUPLICATE);
         }
 
-        long basePoints = pointsCalculator.calculateBasePoints(event);
-        long pointsWithBonus = pointsCalculator.applyStreakBonusIfEligible(
-                basePoints, member.getCurrentStreakMonths());
+        long pointsToAward;
+        try {
+            long basePoints = pointsCalculator.calculateBasePoints(event);
+            long pointsWithBonus = pointsCalculator.applyStreakBonusIfEligible(
+                    basePoints, member.getCurrentStreakMonths());
 
-        YearMonth month = YearMonth.from(event.getPaymentDate());
-        long alreadyEarnedThisMonth = member.getPointsForMonth(month);
-        long remainingCap = Math.max(0, MONTHLY_POINTS_CAP - alreadyEarnedThisMonth);
-        long pointsToAward = Math.min(pointsWithBonus, remainingCap);
-
-        member.addPointsForMonth(month, pointsToAward);
-        processedEventStore.markProcessed(event.getEventId());
+            YearMonth month = YearMonth.from(event.getPaymentDate());
+            synchronized (member) {
+                long alreadyEarnedThisMonth = member.getPointsForMonth(month);
+                long remainingCap = Math.max(0, MONTHLY_POINTS_CAP - alreadyEarnedThisMonth);
+                pointsToAward = Math.min(pointsWithBonus, remainingCap);
+                member.addPointsForMonth(month, pointsToAward);
+            }
+        } catch (RuntimeException e) {
+            processedEventStore.unmark(event.getEventId());
+            throw e;
+        }
 
         ProcessingOutcome outcome = pointsToAward == 0
                 ? ProcessingOutcome.CAPPED

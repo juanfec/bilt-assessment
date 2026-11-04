@@ -21,6 +21,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RewardsEngineTest {
@@ -174,6 +175,68 @@ class RewardsEngineTest {
             assertEquals(1, awardedResults,
                     "at most one worker may award points for the same eventId");
             assertEquals(1500, member.getPointsForMonth(YearMonth.of(2026, 3)));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void releasesTheEventIdWhenProcessingFailsSoItCanBeRetried() {
+        ProcessedEventStore store = new ProcessedEventStore();
+        RewardsEngine failingThenWorking = new RewardsEngine(new PointsCalculator(), store);
+        MemberAccount member = new MemberAccount("member-1", 0);
+        // Too large for a long, so the calculator throws ArithmeticException.
+        PaymentEvent poison = new PaymentEvent("evt-fail", "member-1",
+                new BigDecimal("99999999999999999999"), false, LocalDate.of(2026, 3, 1));
+
+        assertThrows(ArithmeticException.class,
+                () -> failingThenWorking.processPayment(poison, member));
+
+        assertFalse(store.isDuplicate("evt-fail"));
+        assertEquals(0, member.getPointsForMonth(YearMonth.of(2026, 3)));
+    }
+
+    @Test
+    void cappedEventsStillCountAsProcessed() {
+        MemberAccount member = new MemberAccount("member-1", 0);
+        PaymentEvent first = new PaymentEvent("evt-1", "member-1",
+                new BigDecimal("150000"), false, LocalDate.of(2026, 3, 1));
+        PaymentEvent capped = new PaymentEvent("evt-2", "member-1",
+                new BigDecimal("50"), false, LocalDate.of(2026, 3, 2));
+
+        engine.processPayment(first, member);
+        assertEquals(ProcessingOutcome.CAPPED, engine.processPayment(capped, member).getOutcome());
+
+        assertEquals(ProcessingOutcome.DUPLICATE, engine.processPayment(capped, member).getOutcome());
+    }
+
+    @RepeatedTest(8)
+    void concurrentDifferentEventsNeverExceedTheMonthlyCap() throws Exception {
+        int workerCount = 16;
+        MemberAccount member = new MemberAccount("member-1", 0);
+        ExecutorService executor = Executors.newFixedThreadPool(workerCount);
+        CountDownLatch start = new CountDownLatch(1);
+
+        try {
+            List<Future<PointsResult>> futures = new ArrayList<>();
+            for (int worker = 0; worker < workerCount; worker++) {
+                // 16 x 10,000 = 160,000 requested against a 100,000 cap.
+                PaymentEvent event = new PaymentEvent("evt-" + worker, "member-1",
+                        new BigDecimal("10000"), false, LocalDate.of(2026, 3, 1));
+                futures.add(executor.submit(() -> {
+                    start.await();
+                    return engine.processPayment(event, member);
+                }));
+            }
+            start.countDown();
+
+            long totalAwarded = 0;
+            for (Future<PointsResult> future : futures) {
+                totalAwarded += future.get(2, TimeUnit.SECONDS).getPointsAwarded();
+            }
+
+            assertEquals(100_000, totalAwarded);
+            assertEquals(100_000, member.getPointsForMonth(YearMonth.of(2026, 3)));
         } finally {
             executor.shutdownNow();
         }
